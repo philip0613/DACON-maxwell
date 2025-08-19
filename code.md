@@ -1,0 +1,703 @@
+# -*- coding: utf-8 -*-
+"""
+2025 전력사용량 예측 AI 경진대회 — 최종 파이프라인 (주간프로파일+잔차학습+스태킹+TTA, submission.csv 자동저장)
+
+핵심:
+- 주간 프로파일(건물×week-hour 중앙값)로 1차 정규화 → 모델은 잔차(y / wk_prof)를 학습 (scaled2)
+- 모델 가족: LightGBM / XGBoost / CatBoost(MAE) / HistGB / (옵션)MLP — 가용한 것만 자동 사용
+- 가족별 배깅(n_models 시드) → 검증셋에서 메타 스태킹(Ridge, scaled2 space)
+- 검증 기반 잔차 바이어스맵(건물×week-hour, scaled2) + 건물별 Huber 캘리브레이션(원공간)
+- Test-Time Augmentation(TTA)으로 날씨 미세 흔들기 후 평균
+- 오토리그레시브(−168h 나이브)와 동적 블렌딩(건물별) + 상한 클리핑
+- test에 없는 칼럼(일조/일사) 제거, 경로 자동 탐색(./open, ./venv/open 등)
+- PyCharm/Colab 호환(parse_known_args)
+- 출력: ./submissions/submission_*.csv + ./submissions/submission.csv (고정 이름)
+"""
+import os
+import json
+import time
+import argparse
+from typing import Tuple, List, Dict, Any, Optional, Callable
+
+import numpy as np
+import pandas as pd
+
+# ── Optional libs (자동 감지) ────────────────────────────────────────────────
+USE_LGBM = False; lgbm = None
+try:
+    import lightgbm as lgbm
+    USE_LGBM = True
+except Exception:
+    USE_LGBM = False
+
+USE_XGB = False; xgb = None
+try:
+    import xgboost as xgb
+    USE_XGB = True
+except Exception:
+    USE_XGB = False
+
+USE_CAT = False
+try:
+    from catboost import CatBoostRegressor as _CatBoostRegressor
+    USE_CAT = True
+except Exception:
+    USE_CAT = False
+
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.neural_network import MLPRegressor
+from sklearn.linear_model import Ridge, HuberRegressor
+
+# ── Constants ────────────────────────────────────────────────────────────────
+TARGET = "전력소비량(kWh)"
+NUMERIC_BUILDING_COLS = ["연면적(m2)", "냉방면적(m2)", "태양광용량(kW)", "ESS저장용량(kWh)", "PCS용량(kW)"]
+CAT_COLS = ["건물유형"]
+DROP_WEATHER_FOR_TEST = ["일조(hr)", "일사(MJ/m2)"]
+REQUIRED_FILES = ["train.csv", "test.csv", "building_info.csv", "sample_submission.csv"]
+
+LAG_LIST   = [1, 2, 3, 6, 12, 24, 48, 72, 168]
+ROLL_MEANS = [3, 6, 12, 24, 48, 168]
+ROLL_STDS  = [6, 24, 168]
+
+EPS = 1e-3
+
+# ── Utils ────────────────────────────────────────────────────────────────────
+def set_seed(seed: int = 42):
+    import random
+    random.seed(seed); np.random.seed(seed)
+
+def smape(y_true, y_pred) -> float:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    denom = (np.abs(y_true) + np.abs(y_pred)) / 2.0
+    diff = np.abs(y_true - y_pred)
+    sm = np.where(denom == 0, 0.0, diff / denom)
+    return float(100.0 * np.mean(sm))
+
+def ensure_dir(path: str):
+    if not os.path.exists(path): os.makedirs(path, exist_ok=True)
+
+def list_dir_safe(path: str) -> List[str]:
+    try: return sorted(os.listdir(path))
+    except Exception: return []
+
+def to_scalar(x) -> float:
+    """NumPy 1.25 이상에서 안전하게 스칼라 추출."""
+    a = np.asarray(x)
+    if a.size == 0:
+        return 0.0
+    if a.ndim == 0:
+        return float(a)
+    return float(a.ravel()[0])
+
+# ── Path detection ───────────────────────────────────────────────────────────
+def looks_like_data_dir(path: str) -> bool:
+    return all(os.path.exists(os.path.join(path, f)) for f in REQUIRED_FILES)
+
+def find_data_dir(preferred: Optional[str] = None) -> str:
+    tried = []
+    def candidates() -> List[str]:
+        cand = []
+        if preferred: cand.append(os.path.abspath(preferred))
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        cwd = os.getcwd()
+        script_side = [
+            os.path.join(script_dir, "open"),
+            os.path.join(script_dir, "open (1)"),
+            os.path.join(script_dir, "data"),
+            os.path.join(script_dir, "dataset"),
+            os.path.join(script_dir, "venv", "open"),
+            script_dir,
+        ]
+        cwd_side = [
+            os.path.join(cwd, "open"),
+            os.path.join(cwd, "open (1)"),
+            os.path.join(cwd, "data"),
+            os.path.join(cwd, "dataset"),
+            os.path.join(cwd, "venv", "open"),
+            cwd,
+        ]
+        seen=set(); out=[]
+        for p in [*script_side, *cwd_side]:
+            ap=os.path.abspath(p)
+            if ap not in seen: seen.add(ap); out.append(ap)
+        return out
+
+    for c in candidates():
+        tried.append(c)
+        if looks_like_data_dir(c):
+            print(f"[INFO] Using data_dir: {c}")
+            return c
+
+    msg = ["[ERROR] 데이터 폴더를 찾지 못했습니다.", f"필요 파일: {', '.join(REQUIRED_FILES)}", "", "시도한 경로:"]
+    for t in tried:
+        existing = [f for f in REQUIRED_FILES if os.path.exists(os.path.join(t, f))]
+        missing = [f for f in REQUIRED_FILES if f not in existing]
+        msg.append(f" - {t}")
+        msg.append(f"   · 존재: {existing}")
+        msg.append(f"   · 누락: {missing}")
+        if os.path.isdir(t):
+            files = list_dir_safe(t)
+            msg.append(f"   · 디렉토리 내 파일: {files[:20]}{' ...' if len(files)>20 else ''}")
+    raise FileNotFoundError("\n".join(msg))
+
+# ── Load / preprocess ────────────────────────────────────────────────────────
+def load_data(data_dir: str) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    train = pd.read_csv(os.path.join(data_dir, "train.csv"))
+    test = pd.read_csv(os.path.join(data_dir, "test.csv"))
+    building = pd.read_csv(os.path.join(data_dir, "building_info.csv"))
+    sample_sub = pd.read_csv(os.path.join(data_dir, "sample_submission.csv"))
+    return train, test, building, sample_sub
+
+def parse_datetime(df: pd.DataFrame) -> pd.DataFrame:
+    df["일시_dt"] = pd.to_datetime(df["일시"], format="%Y%m%d %H")
+    return df
+
+def preprocess_building(building: pd.DataFrame) -> pd.DataFrame:
+    b = building.copy()
+    for c in NUMERIC_BUILDING_COLS:
+        if c in b.columns:
+            b[c] = pd.to_numeric(b[c].replace("-", np.nan), errors="coerce").fillna(0.0)
+    if "연면적(m2)" in b.columns:
+        if "냉방면적(m2)" in b.columns:
+            b["냉방비율"] = (b["냉방면적(m2)"] / b["연면적(m2)"]).replace([np.inf, -np.inf], 0).fillna(0)
+        if "태양광용량(kW)" in b.columns:
+            b["PV_면적비"] = (b["태양광용량(kW)"] / (b["연면적(m2)"] + 1e-6))
+        if "ESS저장용량(kWh)" in b.columns:
+            b["ESS_면적비"] = (b["ESS저장용량(kWh)"] / (b["연면적(m2)"] + 1e-6))
+        if "PCS용량(kW)" in b.columns:
+            b["PCS_면적비"] = (b["PCS용량(kW)"] / (b["연면적(m2)"] + 1e-6))
+    return b
+
+def merge_building(df: pd.DataFrame, building: pd.DataFrame) -> pd.DataFrame:
+    return df.merge(building, on="건물번호", how="left")
+
+# ── Feature engineering ──────────────────────────────────────────────────────
+def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
+    dt = df["일시_dt"]
+    df["hour"] = dt.dt.hour
+    df["weekday"] = dt.dt.weekday
+    df["month"] = dt.dt.month
+    df["dayofyear"] = dt.dt.dayofyear
+    df["is_weekend"] = (df["weekday"] >= 5).astype(int)
+    df["hour_sin"] = np.sin(2*np.pi*df["hour"]/24); df["hour_cos"] = np.cos(2*np.pi*df["hour"]/24)
+    df["month_sin"] = np.sin(2*np.pi*(df["month"]-1)/12); df["month_cos"] = np.cos(2*np.pi*(df["month"]-1)/12)
+    df["dow_sin"] = np.sin(2*np.pi*df["weekday"]/7); df["dow_cos"] = np.cos(2*np.pi*df["weekday"]/7)
+    df["hov"] = df["weekday"]*24 + df["hour"]  # week-hour index
+    return df
+
+def add_weather_derivatives(df: pd.DataFrame) -> pd.DataFrame:
+    def safe(col): return df[col] if col in df.columns else pd.Series(0.0, index=df.index)
+    T = safe("기온(°C)"); RH = safe("습도(%)"); WS = safe("풍속(m/s)"); R = safe("강수량(mm)")
+    df["temp2"] = T**2; df["hum2"] = RH**2; df["wind2"] = WS**2
+    df["temp_x_hum"] = T * RH; df["rain_bin"] = (R > 0).astype(int)
+    df["CDH"] = np.maximum(T - 24.0, 0.0); df["HDH"] = np.maximum(18.0 - T, 0.0)
+    b, c = 17.62, 243.12
+    gamma = np.log(np.clip(RH, 1e-6, 100.0)/100.0) + (b*T)/(c+T+1e-6)
+    df["dewpoint"] = c*gamma/(b - gamma + 1e-6)
+    if "냉방비율" in df.columns: df["temp_x_coolratio"] = T * df["냉방비율"]
+    return df
+
+def build_weekly_profile(train: pd.DataFrame) -> pd.DataFrame:
+    # 건물×week-hour 중앙값(robust)
+    prof = train.groupby(["건물번호", "hov"])[TARGET].median().rename("wk_prof").reset_index()
+    return prof
+
+def attach_weekly_profile(df: pd.DataFrame, prof: pd.DataFrame) -> pd.DataFrame:
+    out = df.merge(prof, on=["건물번호", "hov"], how="left")
+    # 빌딩 전체 중앙값/전체 중앙값으로 백오프
+    if "bld_median" in out.columns:
+        out["wk_prof"] = out["wk_prof"].fillna(out["bld_median"])
+    out["wk_prof"] = out["wk_prof"].fillna(out[TARGET].median() if TARGET in out.columns else out["wk_prof"].median())
+    out["wk_prof"] = out["wk_prof"].replace(0, out["wk_prof"].median())
+    return out
+
+def add_building_stats(train: pd.DataFrame, test: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    agg = train.groupby("건물번호")[TARGET].agg(
+        bld_mean="mean", bld_median="median", bld_std="std",
+        bld_p90=lambda x: np.percentile(x, 90),
+        bld_p10=lambda x: np.percentile(x, 10),
+        bld_max="max"
+    ).reset_index()
+    train = train.merge(agg, on="건물번호", how="left")
+    test  = test.merge(agg, on="건물번호", how="left")
+    for c in ["bld_std"]:
+        if c in train.columns: train[c] = train[c].fillna(0.0); test[c] = test[c].fillna(0.0)
+    return train, test
+
+def add_lag_rolling_train(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.sort_values(["건물번호", "일시_dt"]).copy()
+    grp = df.groupby("건물번호", group_keys=False)
+    for lag in LAG_LIST: df[f"lag_{lag}"] = grp[TARGET].shift(lag)
+    for w in ROLL_MEANS:
+        df[f"roll{w}_mean"] = grp[TARGET].shift(1).rolling(window=w, min_periods=max(3, w//2)).mean()
+    for w in ROLL_STDS:
+        df[f"roll{w}_std"]  = grp[TARGET].shift(1).rolling(window=w, min_periods=max(3, w//2)).std()
+    need_cols = [f"lag_{l}" for l in LAG_LIST] + [f"roll{w}_mean" for w in ROLL_MEANS] + [f"roll{w}_std" for w in ROLL_STDS]
+    df = df.dropna(subset=need_cols).reset_index(drop=True)
+    return df
+
+# ── Feature matrices ─────────────────────────────────────────────────────────
+def build_feature_matrices(train_fe: pd.DataFrame, test_df: pd.DataFrame, *, target_col: str):
+    """target_col: 모델 학습에 사용할 타깃 컬럼명 (e.g., 'target_scaled2')"""
+    train_fe = train_fe.drop(columns=[c for c in DROP_WEATHER_FOR_TEST if c in train_fe.columns], errors="ignore")
+    test_df  = test_df.drop (columns=[c for c in DROP_WEATHER_FOR_TEST if c in test_df.columns], errors="ignore")
+
+    for col in CAT_COLS:
+        if col in train_fe.columns:
+            train_fe[col] = train_fe[col].astype("category")
+            test_df[col]  = pd.Categorical(test_df[col], categories=train_fe[col].cat.categories)
+
+    if "건물번호" in train_fe.columns:
+        cats = train_fe["건물번호"].astype("category")
+        train_fe["건물번호_cat"] = cats.cat.codes
+        test_cats = pd.Categorical(test_df["건물번호"], categories=cats.cat.categories)
+        test_df["건물번호_cat"] = test_cats.codes
+
+    lag_roll_cols = [c for c in train_fe.columns if c.startswith("lag_") or c.startswith("roll")]
+    drop_always = [TARGET, "일시", "일시_dt", "num_date_time"]
+    base_cols = [c for c in train_fe.columns if c not in drop_always + lag_roll_cols]
+
+    cat_for_dummies = [c for c in CAT_COLS if c in base_cols]
+    for c in base_cols:
+        if c not in test_df.columns: test_df[c] = np.nan
+
+    base_for_dummies = pd.concat([train_fe[base_cols], test_df[base_cols]], axis=0, ignore_index=True)
+    X_base = pd.get_dummies(base_for_dummies, columns=cat_for_dummies, drop_first=False)
+
+    n_train = len(train_fe)
+    X_train_core = X_base.iloc[:n_train].reset_index(drop=True)
+    X_test_core  = X_base.iloc[n_train:].reset_index(drop=True)
+
+    X_train = pd.concat([X_train_core, train_fe[lag_roll_cols].reset_index(drop=True)], axis=1)
+
+    if target_col not in train_fe.columns:
+        raise ValueError(f"{target_col} 가 없습니다. 타깃 전처리를 확인하세요.")
+    y_train = train_fe[target_col].astype(float).reset_index(drop=True)
+
+    return X_train, y_train, X_test_core
+
+def time_split_mask(df: pd.DataFrame, valid_days: int = 7):
+    last_day = df["일시_dt"].max().normalize()
+    valid_start = last_day - pd.Timedelta(days=valid_days-1)
+    mask_valid = (df["일시_dt"] >= valid_start)
+    mask_train = ~mask_valid
+    return mask_train.values, mask_valid.values
+
+# ── Training per family ──────────────────────────────────────────────────────
+def train_family_models(family: str, seeds: List[int],
+                        X_tr: pd.DataFrame, y_tr: pd.Series,
+                        X_va: pd.DataFrame, y_va_scaled2: pd.Series,
+                        sample_weight_tr: Optional[np.ndarray]) -> Dict[str, Any]:
+    """Return dict: family, models, va_scaled2 (avg), smape_on_orig? (나중에 메타에서 계산)"""
+    models = []
+
+    def _fit_one(seed: int):
+        if family == "lgbm" and USE_LGBM:
+            m = lgbm.LGBMRegressor(
+                n_estimators=6000, learning_rate=0.03, num_leaves=127, max_depth=-1,
+                min_child_samples=40, subsample=0.85, colsample_bytree=0.85,
+                reg_lambda=1.0, reg_alpha=0.0, random_state=seed, n_jobs=-1
+            )
+            try:
+                m.fit(X_tr, y_tr, sample_weight=sample_weight_tr,
+                      eval_set=[(X_va, y_va_scaled2)], eval_metric="l1", verbose=False)
+            except Exception:
+                m = lgbm.LGBMRegressor(n_estimators=2500, learning_rate=0.045, num_leaves=63, random_state=seed, n_jobs=-1)
+                m.fit(X_tr, y_tr, sample_weight=sample_weight_tr)
+            return m
+
+        if family == "xgb" and USE_XGB:
+            m = xgb.XGBRegressor(
+                n_estimators=3000, learning_rate=0.03, max_depth=8,
+                subsample=0.85, colsample_bytree=0.85, min_child_weight=2.0,
+                reg_lambda=1.0, reg_alpha=0.0, random_state=seed, n_jobs=-1,
+                objective="reg:squarederror", tree_method="hist"
+            )
+            m.fit(X_tr, y_tr, sample_weight=sample_weight_tr, verbose=False)
+            return m
+
+        if family == "cat" and USE_CAT:
+            m = _CatBoostRegressor(
+                iterations=4500, learning_rate=0.03, depth=8,
+                l2_leaf_reg=3.0, loss_function="MAE",  # MAE로 변경
+                random_seed=seed, verbose=False
+            )
+            m.fit(X_tr.values, y_tr.values, sample_weight=sample_weight_tr)
+            return m
+
+        if family == "histgb":
+            m = HistGradientBoostingRegressor(
+                max_depth=12, learning_rate=0.035, max_iter=2000,
+                l2_regularization=0.0, early_stopping=True, random_state=seed
+            )
+            m.fit(X_tr, y_tr, sample_weight=sample_weight_tr)
+            return m
+
+        if family == "mlp":
+            m = MLPRegressor(
+                hidden_layer_sizes=(256, 128), activation="relu", solver="adam",
+                learning_rate_init=1e-3, alpha=1e-4, batch_size=512,
+                max_iter=200, random_state=seed, early_stopping=True,
+                n_iter_no_change=20, verbose=False
+            )
+            m.fit(X_tr, y_tr)
+            return m
+
+        return None
+
+    for s in seeds:
+        m = _fit_one(s)
+        if m is not None:
+            models.append(m)
+
+    if not models:
+        return {"family": family, "models": [], "va_scaled2": None}
+
+    # family 평균 예측 (scaled2)
+    preds = None
+    for m in models:
+        p = m.predict(X_va if family != "cat" else X_va.values)
+        preds = p if preds is None else (preds + p)
+    preds = preds / max(len(models), 1)
+    va_scaled2 = np.asarray(preds).astype(float)
+    return {"family": family, "models": models, "va_scaled2": va_scaled2}
+
+# ── Residual bias & calibration & blending ───────────────────────────────────
+def compute_residual_bias_map_scaled2(train_fe: pd.DataFrame, X_va: pd.DataFrame,
+                                      y_true_va_orig: np.ndarray, wk_prof_va: np.ndarray,
+                                      model_predict_scaled2: Callable[[pd.DataFrame], np.ndarray]) -> Dict[tuple, float]:
+    """(건물, hour_of_week) -> median residual in scaled2 space."""
+    hov = (train_fe.loc[X_va.index, "hov"].astype(int)).values
+    bno = train_fe.loc[X_va.index, "건물번호"].astype(int).values
+    yhat_scaled2 = np.asarray(model_predict_scaled2(X_va), dtype=float)
+    y_va_scaled2 = (y_true_va_orig / (wk_prof_va + EPS))
+    res = y_va_scaled2 - yhat_scaled2  # scaled2 residual
+
+    bias_map: Dict[tuple, float] = {}
+    df_tmp = pd.DataFrame({"b": bno, "hov": hov, "res": res})
+    for (b, h), grp in df_tmp.groupby(["b", "hov"]):
+        bias_map[(int(b), int(h))] = float(np.median(grp["res"].values))
+    return bias_map
+
+def per_building_blend_weights(train_fe: pd.DataFrame, X_va: pd.DataFrame,
+                               y_true_va_orig: np.ndarray, yhat_model_va_orig: np.ndarray) -> Dict[int, float]:
+    bno = train_fe.loc[X_va.index, "건물번호"].astype(int).values
+    naive = train_fe.loc[X_va.index, "lag_168"].astype(float).values
+    weights = {}
+    df = pd.DataFrame({"b": bno, "y": y_true_va_orig, "m": yhat_model_va_orig, "n": naive})
+    for b, g in df.groupby("b"):
+        sm_model = smape(g["y"].values, g["m"].values)
+        sm_naive = smape(g["y"].values, g["n"].values)
+        diff = sm_naive - sm_model
+        w = 1/(1 + np.exp(-diff/2))
+        weights[int(b)] = float(np.clip(w, 0.35, 0.92))
+    return weights
+
+def per_building_calibration(train_fe: pd.DataFrame, X_va: pd.DataFrame,
+                             y_true_va_orig: np.ndarray, yhat_model_va_orig: np.ndarray) -> Dict[int, tuple]:
+    bno = train_fe.loc[X_va.index, "건물번호"].astype(int).values
+    df = pd.DataFrame({"b": bno, "y": y_true_va_orig, "m": yhat_model_va_orig})
+    calib: Dict[int, tuple] = {}
+    for b, g in df.groupby("b"):
+        x = g["m"].values.reshape(-1, 1); y = g["y"].values
+        if len(g) < 8:
+            calib[int(b)] = (1.0, 0.0); continue
+        try:
+            huber = HuberRegressor(alpha=1e-4, epsilon=1.5).fit(x, y)
+            a = float(huber.coef_[0]); b0 = float(huber.intercept_)
+            if not np.isfinite(a) or abs(a) > 3: a = 1.0
+            if not np.isfinite(b0) or abs(b0) > 1e6: b0 = 0.0
+            calib[int(b)] = (a, b0)
+        except Exception:
+            calib[int(b)] = (1.0, 0.0)
+    return calib
+
+# ── Run once ─────────────────────────────────────────────────────────────────
+def run_once(args, seed: int = 42) -> Dict[str, Any]:
+    set_seed(seed)
+    data_dir = find_data_dir(args.data_dir)
+
+    # 1) Load
+    train, test, building, sample_sub = load_data(data_dir)
+    test = test.copy(); test["row_id_for_align"] = np.arange(len(test))
+
+    # 2) Preprocess & merge
+    train = parse_datetime(train); test = parse_datetime(test)
+    building = preprocess_building(building)
+    train = merge_building(train, building); test = merge_building(test, building)
+
+    # 3) Drop columns not in test
+    train = train.drop(columns=[c for c in DROP_WEATHER_FOR_TEST if c in train.columns], errors="ignore")
+    test  = test.drop (columns=[c for c in DROP_WEATHER_FOR_TEST if c in test.columns], errors="ignore")
+
+    # 4) Features
+    train = add_time_features(train);  test  = add_time_features(test)
+    train = add_weather_derivatives(train); test = add_weather_derivatives(test)
+
+    # 5) Building stats + Weekly profile
+    train, test = add_building_stats(train, test)
+    prof = build_weekly_profile(train)
+    train = attach_weekly_profile(train, prof)
+    test  = attach_weekly_profile(test,  prof)
+
+    # 6) Lag/Rolling (train only)
+    train_fe = add_lag_rolling_train(train)
+
+    # 7) 타깃 정의: scaled2 = TARGET / wk_prof
+    train_fe["target_scaled2"] = (train_fe[TARGET].astype(float) / (train_fe["wk_prof"].astype(float) + EPS))
+
+    # 8) Matrices
+    X_train, y_train_scaled2, X_test_core = build_feature_matrices(train_fe, test, target_col="target_scaled2")
+    X_test_core = X_test_core.copy()
+    X_test_core["row_id_for_align"] = test["row_id_for_align"].reset_index(drop=True)
+
+    # 9) Time split
+    mask_tr, mask_va = time_split_mask(train_fe, valid_days=args.valid_days)
+    X_tr, X_va = X_train[mask_tr], X_train[mask_va]
+    y_tr_scaled2, y_va_scaled2 = y_train_scaled2[mask_tr], y_train_scaled2[mask_va]
+    y_true_va_orig = train_fe.loc[mask_va, TARGET].astype(float).values
+    wk_prof_va  = train_fe.loc[mask_va, "wk_prof"].astype(float).values
+
+    # 10) SMAPE-like sample weights in scaled2 space
+    sw_tr = 1.0 / (np.abs(y_tr_scaled2.values) + EPS)
+
+    # 11) Family list (available only)
+    all_fams = []
+    for fam in args.families.split(","):
+        fam = fam.strip().lower()
+        if fam == "lgbm" and USE_LGBM: all_fams.append("lgbm")
+        elif fam == "xgb" and USE_XGB: all_fams.append("xgb")
+        elif fam == "cat" and USE_CAT: all_fams.append("cat")
+        elif fam == "histgb": all_fams.append("histgb")
+        elif fam == "mlp": all_fams.append("mlp")
+    if not all_fams:
+        all_fams = ["histgb"]
+
+    # 12) Train each family with bagging
+    fam_results = []
+    seeds = [seed + i*101 for i in range(args.n_models)]
+    for fam in all_fams:
+        res = train_family_models(fam, seeds, X_tr, y_tr_scaled2, X_va, y_va_scaled2, sw_tr)
+        fam_results.append(res)
+    fam_kept = [r for r in fam_results if r["va_scaled2"] is not None]
+    if not fam_kept:
+        raise RuntimeError("No models were trained. Check installed libraries or families flag.")
+
+    # 13) Meta stacking on validation (scaled2 space)
+    #   Z: [n_va, n_families], each column = family averaged prediction (scaled2)
+    Z_cols = []
+    for r in fam_kept:
+        # 이미 bagging-avg 수행된 va_scaled2
+        Z_cols.append(r["va_scaled2"])
+    Z = np.vstack(Z_cols).T  # [n_va, k]
+    meta = Ridge(alpha=1e-2, fit_intercept=False).fit(Z, y_va_scaled2.values)
+    meta_w = meta.coef_.clip(0)  # 음수 가중 방지
+    s = meta_w.sum()
+    if s <= 0:  # 예외 시 균등
+        meta_w = np.ones_like(meta_w)/len(meta_w)
+    else:
+        meta_w = meta_w / s
+
+    def ens_predict_scaled2_meta(X: pd.DataFrame) -> np.ndarray:
+        cols = []
+        for r in fam_kept:
+            preds_scaled2 = None
+            for m in r["models"]:
+                p = m.predict(X if r["family"] != "cat" else X.values)
+                preds_scaled2 = p if preds_scaled2 is None else (preds_scaled2 + p)
+            preds_scaled2 = preds_scaled2 / max(len(r["models"]),1)
+            cols.append(preds_scaled2)
+        if not cols:
+            return np.zeros(len(X), dtype=float)
+        M = np.vstack(cols).T  # [n, k]
+        return (M @ meta_w).astype(float)
+
+    # 14) Validation metrics (orig space)
+    yhat_va_scaled2 = ens_predict_scaled2_meta(X_va)
+    yhat_va_orig = yhat_va_scaled2 * (wk_prof_va + EPS)
+    va_smape_model = smape(y_true_va_orig, yhat_va_orig)
+    y_va_naive = train_fe.loc[mask_va, "lag_168"].astype(float).values
+    va_smape_naive = smape(y_true_va_orig, y_va_naive)
+
+    # 15) Residual bias map (scaled2)
+    bias_map = compute_residual_bias_map_scaled2(
+        train_fe=train_fe, X_va=X_va, y_true_va_orig=y_true_va_orig, wk_prof_va=wk_prof_va,
+        model_predict_scaled2=ens_predict_scaled2_meta
+    )
+
+    # 16) Calibration & blend (orig)
+    calib_map = per_building_calibration(train_fe, X_va, y_true_va_orig, yhat_va_orig)
+    blend_w = per_building_blend_weights(train_fe, X_va, y_true_va_orig, yhat_va_orig)
+
+    # 17) Report
+    print("\n========== Local Validation (last {} days) ==========".format(args.valid_days))
+    print("Families used & (meta weights order below):")
+    for i, r in enumerate(fam_kept):
+        print(f" - {r['family']:7s} | models {len(r['models'])} | meta_w slot {i}")
+    print("meta_w:", np.round(meta_w, 4).tolist())
+    print(f"SMAPE - Model-only(ens+meta): {va_smape_model:.4f}")
+    print(f"SMAPE - Naive(−168h)       : {va_smape_naive:.4f}")
+    # 캘리브+블렌드 검증 성능
+    bno_va = train_fe.loc[mask_va, "건물번호"].astype(int).values
+    a_arr = np.array([calib_map.get(int(b), (1.0, 0.0))[0] for b in bno_va])
+    b_arr = np.array([calib_map.get(int(b), (1.0, 0.0))[1] for b in bno_va])
+    yhat_calib_va = a_arr * yhat_va_orig + b_arr
+    w_arr = np.array([blend_w.get(int(b), 0.7) for b in bno_va], dtype=float)
+    yhat_blend_va = w_arr * yhat_calib_va + (1.0 - w_arr) * y_va_naive
+    va_smape_blend = smape(y_true_va_orig, yhat_blend_va)
+    print(f"SMAPE - Calibrated+Blend  : {va_smape_blend:.4f}")
+    print("=====================================================\n")
+
+    # 18) Caps for clipping
+    cap_map = train.groupby("건물번호")[TARGET].quantile(0.998).to_dict()
+
+    # 19) Inference (AR + bias + calib + blend + clip + TTA)
+    feature_names = X_train.columns.tolist()
+    from collections import deque
+    seed_df = train.sort_values(["건물번호","일시_dt"])[["건물번호","일시_dt", TARGET]].copy()
+    history = {}
+    max_need = max(LAG_LIST + [max(ROLL_MEANS + ROLL_STDS)]) + 1
+    for b, grp in seed_df.groupby("건물번호"):
+        vals = grp[TARGET].astype(float).values.tolist()
+        history[b] = deque(vals[-max_need:], maxlen=max_need)
+
+    X_lookup = X_test_core.set_index("row_id_for_align")
+    test_sorted = test.sort_values(["일시_dt","건물번호"]).copy()
+    preds = []
+
+    # TTA 시나리오(작게 흔들기)
+    TTA_SET = [
+        {"기온(°C)": +0.3, "습도(%)": 0, "풍속(m/s)": 0,   "강수량(mm)": 0},
+        {"기온(°C)": -0.3, "습도(%)": 0, "풍속(m/s)": 0,   "강수량(mm)": 0},
+        {"기온(°C)": 0,    "습도(%)": +3, "풍속(m/s)": 0.2, "강수량(mm)": 0},
+        {"기온(°C)": 0,    "습도(%)": -3, "풍속(m/s)": -0.2,"강수량(mm)": 0},
+        {"기온(°C)": 0,    "습도(%)": 0, "풍속(m/s)": 0,   "강수량(mm)": 0},  # 원본
+    ]
+
+    def last_mean(dq, w):
+        if len(dq) < w:
+            fill = np.mean(dq) if len(dq) else 0.0
+            tmp = list(dq) + [fill]*(w-len(dq)); return float(np.mean(tmp))
+        return float(np.mean(list(dq)[-w:]))
+
+    def last_std(dq, w):
+        if len(dq) < w:
+            fill = np.mean(dq) if len(dq) else 0.0
+            tmp = list(dq) + [fill]*(w-len(dq)); return float(np.std(tmp))
+        return float(np.std(list(dq)[-w:]))
+
+    def predict_scaled2_with_tta(x_row_df: pd.DataFrame) -> float:
+        vals = []
+        for dtt in TTA_SET:
+            x = x_row_df.copy()
+            for k, dv in dtt.items():
+                if k in x.columns:
+                    x[k] = x[k].astype(float) + dv
+            ysc = ens_predict_scaled2_meta(x)[0]
+            vals.append(ysc)
+        return float(np.mean(vals))
+
+    for _, row in test_sorted.iterrows():
+        b = int(row["건물번호"]); rid = int(row["row_id_for_align"])
+        dq = history.get(b)
+        if dq is None:
+            dq = deque([], maxlen=max_need); history[b] = dq
+
+        row_feats = {}
+        for lag in LAG_LIST:
+            row_feats[f"lag_{lag}"] = float(list(dq)[-lag]) if len(dq) >= lag else (float(np.mean(dq)) if len(dq) else 0.0)
+        for w in ROLL_MEANS: row_feats[f"roll{w}_mean"] = last_mean(dq, w)
+        for w in ROLL_STDS:  row_feats[f"roll{w}_std"]  = last_std(dq, w)
+
+        core_series = X_lookup.loc[rid]
+        row_dict = core_series.to_dict()
+        row_dict.update(row_feats)
+        x_row_df = pd.DataFrame([row_dict], columns=feature_names)
+
+        # 메타+TTA (scaled2)
+        yhat_scaled2 = predict_scaled2_with_tta(x_row_df)
+
+        # bias (scaled2)
+        hov = int(row["hov"])
+        yhat_scaled2 += float(bias_map.get((b, hov), 0.0))
+
+        # 복원 (orig)
+        wk = float(row["wk_prof"]) if "wk_prof" in row else 1.0
+        yhat_model = yhat_scaled2 * (wk + EPS)
+
+        # calibration y ≈ a*ŷ + b
+        a, b0 = calib_map.get(b, (1.0, 0.0))
+        yhat_model = a * yhat_model + b0
+
+        # naive
+        naive = row_feats.get("lag_168", float(np.mean(dq) if len(dq) else 0.0))
+
+        # blend
+        w_bl = blend_w.get(b, 0.7)
+        yhat = w_bl*yhat_model + (1-w_bl)*naive
+
+        # clip
+        cap = cap_map.get(b, None)
+        if cap is not None:
+            yhat = float(np.clip(yhat, 0.0, cap * 1.15))
+        else:
+            yhat = max(0.0, yhat)
+
+        preds.append(yhat)
+        dq.append(yhat); history[b] = dq
+
+    pred_df = test_sorted.copy()
+    pred_df["pred"] = preds
+    pred_df = pred_df[["num_date_time","pred"]]
+
+    # 20) Submission (타임스탬프 파일 + 고정 이름 submission.csv)
+    sub = sample_sub.merge(pred_df, on="num_date_time", how="left")
+    sub["answer"] = sub["pred"].astype(float)
+    sub = sub[["num_date_time","answer"]]
+
+    ensure_dir(args.out_dir)
+    stamp = time.strftime("%m%d_%H%M%S")
+    fname_ts = f"submission_stack_tta_seed{seed}_vd{args.valid_days}_{stamp}.csv"
+    out_ts = os.path.join(args.out_dir, fname_ts)
+    out_fixed = os.path.join(args.out_dir, "submission.csv")
+
+    sub.to_csv(out_ts, index=False, encoding="utf-8-sig")
+    sub.to_csv(out_fixed, index=False, encoding="utf-8-sig")
+
+    # Summary
+    summary = {
+        "timestamp": stamp,
+        "families": [r["family"] for r in fam_kept],
+        "meta_weights": np.round(meta_w, 6).tolist(),
+        "valid_days": args.valid_days, "n_models_per_family": args.n_models,
+        "smape_model_only": round(float(va_smape_model), 5),
+        "smape_naive": round(float(va_smape_naive), 5),
+        "smape_calib_blend": round(float(va_smape_blend), 5),
+        "output_path_timestamped": out_ts.replace("\\","/"),
+        "output_path_submission_csv": out_fixed.replace("\\","/"),
+        "data_dir_used": find_data_dir(args.data_dir)
+    }
+    with open(os.path.join(args.out_dir, "run_summaries.jsonl"), "a", encoding="utf-8") as f:
+        f.write(json.dumps(summary, ensure_ascii=False) + "\n")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    print(f"\n[OK] Saved submission files:\n - {out_ts}\n - {out_fixed}\n")
+    return summary
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_dir", type=str, default=None, help="데이터 폴더(미지정 시 자동 탐색)")
+    parser.add_argument("--out_dir",  type=str, default="./submissions")
+    parser.add_argument("--valid_days", type=int, default=7)
+    parser.add_argument("--n_models", type=int, default=3, help="가족별 배깅 모델 수")
+    parser.add_argument("--families", type=str, default="lgbm,xgb,cat,histgb",
+                        help="사용할 모델 가족 CSV (예: lgbm,xgb,cat,histgb,mlp)")
+    parser.add_argument("--seed", type=int, default=42)
+    args, _ = parser.parse_known_args()
+
+    ensure_dir(args.out_dir)
+    run_once(args, seed=args.seed)
+
+if __name__ == "__main__":
+    main()
