@@ -324,7 +324,6 @@ def train_family_models(family: str, seeds: List[int],
             return m
 
         if family == "cat" and USE_CAT:
-            # MAE 목적 + Overfitting detector
             m = _CatBoostRegressor(
                 iterations=20000, learning_rate=0.03, depth=8,
                 l2_leaf_reg=3.0, loss_function="MAE",
@@ -343,7 +342,6 @@ def train_family_models(family: str, seeds: List[int],
             return m
 
         if family == "histgb":
-            # 자체 early_stopping 사용
             m = HistGradientBoostingRegressor(
                 max_depth=12, learning_rate=0.035, max_iter=5000,
                 l2_regularization=0.0, early_stopping=True,
@@ -652,7 +650,7 @@ def run_once(args, seed: int = 42) -> Dict[str, Any]:
     pred_df["pred"] = preds
     pred_df = pred_df[["num_date_time","pred"]]
 
-    # 20) Submission
+    # 20) Submission (저장 경로/성공 여부/완료 메시지까지 출력)
     sub = sample_sub.merge(pred_df, on="num_date_time", how="left")
     sub["answer"] = sub["pred"].astype(float)
     sub = sub[["num_date_time","answer"]]
@@ -663,8 +661,23 @@ def run_once(args, seed: int = 42) -> Dict[str, Any]:
     out_ts = os.path.join(args.out_dir, fname_ts)
     out_fixed = os.path.join(args.out_dir, "submission.csv")
 
-    sub.to_csv(out_ts, index=False, encoding="utf-8-sig")
-    sub.to_csv(out_fixed, index=False, encoding="utf-8-sig")
+    out_ts_abs = os.path.abspath(out_ts)
+    out_fixed_abs = os.path.abspath(out_fixed)
+
+    try:
+        sub.to_csv(out_ts_abs, index=False, encoding="utf-8-sig")
+        sub.to_csv(out_fixed_abs, index=False, encoding="utf-8-sig")
+    except Exception as e:
+        print("[ERROR] 제출 파일 저장 중 예외:", repr(e))
+        print("[HINT] out_dir 쓰기 권한/경로를 확인하세요:", os.path.abspath(args.out_dir))
+        raise
+
+    ok_ts = os.path.exists(out_ts_abs)
+    ok_fixed = os.path.exists(out_fixed_abs)
+
+    print("\n[SAVE] Attempted to save submissions:")
+    print(" - timestamped:", out_ts_abs, "->", "OK" if ok_ts else "FAIL")
+    print(" - latest     :", out_fixed_abs, "->", "OK" if ok_fixed else "FAIL")
 
     summary = {
         "timestamp": stamp,
@@ -675,14 +688,19 @@ def run_once(args, seed: int = 42) -> Dict[str, Any]:
         "smape_naive": round(float(va_smape_naive), 5),
         "smape_calib_blend": round(float(va_smape_blend), 5),
         "early_stopping_rounds": args.es_rounds,
-        "output_path_timestamped": out_ts.replace("\\","/"),
-        "output_path_submission_csv": out_fixed.replace("\\","/"),
+        "output_path_timestamped": out_ts_abs.replace("\\","/"),
+        "output_path_submission_csv": out_fixed_abs.replace("\\","/"),
+        "cwd_when_saving": os.path.abspath(os.getcwd()),
         "data_dir_used": find_data_dir(args.data_dir)
     }
     with open(os.path.join(args.out_dir, "run_summaries.jsonl"), "a", encoding="utf-8") as f:
         f.write(json.dumps(summary, ensure_ascii=False) + "\n")
+
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    print(f"\n[OK] Saved submission files:\n - {out_ts}\n - {out_fixed}\n")
+    print("\n[OK] Saved submission files to:")
+    print(" -", out_ts_abs)
+    print(" -", out_fixed_abs)
+    print("\n[DONE] 제출 파일 저장 완료 ✅")
     return summary
 
 # ── Main ─────────────────────────────────────────────────────────────────────
