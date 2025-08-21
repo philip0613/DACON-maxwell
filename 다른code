@@ -1,14 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-2025 전력사용량 예측 AI 경진대회 — EarlyStopping 최적화 최종 파이프라인
-- 주간 프로파일 기반 잔차학습(scaled2 = y / wk_prof)
-- 가족별 배깅 + 메타 스태킹(Ridge, scaled2 space)
-- Residual bias map(건물×week-hour, scaled2), 건물별 Huber 캘리브레이션(원공간)
-- TTA(날씨 미세 흔들기) + AR(-168h) 블렌딩 + 상한 클리핑
-- test에 없는 칼럼 제거(일조/일사), 경로 자동탐색(./open, ./venv/open 등)
-- EarlyStopping: LGBM/XGB/CatBoost/HistGB 적용
-- 출력: ./submissions/submission_*.csv + ./submissions/submission.csv
+2025 전력사용량 예측 AI 경진대회 — 최종 안정화 파이프라인 (Ultra Safe 포함)
+
+핵심 특징
+- 주간 프로파일 기반 스케일링(scaled2 = y / wk_prof) + 잔차학습
+- 가족별 배깅(Cat/LGBM/XGB/HistGB/MLP) + Ridge 메타 스태킹(scaled2 space)
+- Safe Mode:
+  * safe_mode=2 (울트라 세이프): bias/TTA/calib OFF, Naive(-168h) ≥ 0.85, 주간프로파일×최근스케일 강블렌드
+  * safe_mode=1 (세이프): bias 축소/클립, TTA/Calib OFF, Naive 하한 0.60
+  * safe_mode=0 (풀기능): 약한 제약
+- 예측 안정화 강화:
+  * 시간대별 상한(건물×hov) 클립 + 건물 글로벌 상한 병행
+  * Horizon-weighted 블렌딩(테스트 초반 naive 비중↑, 후반 모델 비중↑)
+  * 저부하(낮은 부하) 시간대 소프트 클립(야간/휴일 안정)
+- 제출 직전 정합성 검증(행수/정렬/NaN/중복) + 절대경로 저장 + 저장 완료 메시지
+- 경로 자동 탐색(./open, ./venv/open 등)
+
+사용 예시
+  python main.py --data_dir ./venv/open --out_dir ./submissions --valid_days 14 --families histgb --n_models 1 --safe_mode 2
+  python main.py --data_dir ./venv/open --out_dir ./submissions --valid_days 14 --families lgbm,histgb --n_models 2 --safe_mode 1
 """
+
 import os
 import json
 import time
@@ -54,7 +66,6 @@ REQUIRED_FILES = ["train.csv", "test.csv", "building_info.csv", "sample_submissi
 LAG_LIST   = [1, 2, 3, 6, 12, 24, 48, 72, 168]
 ROLL_MEANS = [3, 6, 12, 24, 48, 168]
 ROLL_STDS  = [6, 24, 168]
-
 EPS = 1e-3
 
 # ── Utils ────────────────────────────────────────────────────────────────────
@@ -76,12 +87,6 @@ def ensure_dir(path: str):
 def list_dir_safe(path: str) -> List[str]:
     try: return sorted(os.listdir(path))
     except Exception: return []
-
-def to_scalar(x) -> float:
-    a = np.asarray(x)
-    if a.size == 0: return 0.0
-    if a.ndim == 0: return float(a)
-    return float(a.ravel()[0])
 
 # ── Path detection ───────────────────────────────────────────────────────────
 def looks_like_data_dir(path: str) -> bool:
@@ -176,7 +181,7 @@ def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     df["hour_sin"] = np.sin(2*np.pi*df["hour"]/24); df["hour_cos"] = np.cos(2*np.pi*df["hour"]/24)
     df["month_sin"] = np.sin(2*np.pi*(df["month"]-1)/12); df["month_cos"] = np.cos(2*np.pi*(df["month"]-1)/12)
     df["dow_sin"] = np.sin(2*np.pi*df["weekday"]/7); df["dow_cos"] = np.cos(2*np.pi*df["weekday"]/7)
-    df["hov"] = df["weekday"]*24 + df["hour"]  # week-hour index
+    df["hov"] = df["weekday"]*24 + df["hour"]  # week-hour index (0~167)
     return df
 
 def add_weather_derivatives(df: pd.DataFrame) -> pd.DataFrame:
@@ -395,7 +400,8 @@ def compute_residual_bias_map_scaled2(train_fe: pd.DataFrame, X_va: pd.DataFrame
     return bias_map
 
 def per_building_blend_weights(train_fe: pd.DataFrame, X_va: pd.DataFrame,
-                               y_true_va_orig: np.ndarray, yhat_model_va_orig: np.ndarray) -> Dict[int, float]:
+                               y_true_va_orig: np.ndarray, yhat_model_va_orig: np.ndarray,
+                               min_blend: float, max_blend: float) -> Dict[int, float]:
     bno = train_fe.loc[X_va.index, "건물번호"].astype(int).values
     naive = train_fe.loc[X_va.index, "lag_168"].astype(float).values
     weights = {}
@@ -405,7 +411,7 @@ def per_building_blend_weights(train_fe: pd.DataFrame, X_va: pd.DataFrame,
         sm_naive = smape(g["y"].values, g["n"].values)
         diff = sm_naive - sm_model
         w = 1/(1 + np.exp(-diff/2))
-        weights[int(b)] = float(np.clip(w, 0.35, 0.92))
+        weights[int(b)] = float(np.clip(w, min_blend, max_blend))
     return weights
 
 def per_building_calibration(train_fe: pd.DataFrame, X_va: pd.DataFrame,
@@ -427,10 +433,40 @@ def per_building_calibration(train_fe: pd.DataFrame, X_va: pd.DataFrame,
             calib[int(b)] = (1.0, 0.0)
     return calib
 
+def compute_recent_bld_scale(train_fe: pd.DataFrame, days: int = 28) -> Dict[int, float]:
+    """최근 N일의 scaled2(=y/wk_prof) 중앙값을 건물별로 구해 베이스라인 스케일로 사용"""
+    last_ts = train_fe["일시_dt"].max()
+    start_ts = last_ts - pd.Timedelta(days=days)
+    df_tail = train_fe[train_fe["일시_dt"] >= start_ts].copy()
+    df_tail["scaled2_tail"] = (df_tail[TARGET].astype(float) / (df_tail["wk_prof"].astype(float) + EPS))
+    m = df_tail.groupby("건물번호")["scaled2_tail"].median().to_dict()
+    for b in train_fe["건물번호"].unique():
+        if int(b) not in m: m[int(b)] = 1.0
+    for k in list(m.keys()):
+        v = float(m[k])
+        if not np.isfinite(v): v = 1.0
+        m[k] = float(np.clip(v, 0.3, 3.0))
+    return m
+
 # ── Run once ─────────────────────────────────────────────────────────────────
 def run_once(args, seed: int = 42) -> Dict[str, Any]:
     set_seed(seed)
     data_dir = find_data_dir(args.data_dir)
+
+    # Safe mode 설정
+    safe_level = int(getattr(args, "safe_mode", 1))
+    if safe_level >= 2:
+        BIAS_SCALE = 0.0; BIAS_CLIP = 0.0; USE_CALIB = False; USE_TTA = False
+        MIN_BLEND = 0.85; MAX_BLEND = 0.95
+    else:
+        BIAS_SCALE = 0.25 if safe_level == 1 else 1.0
+        BIAS_CLIP  = 0.08  if safe_level == 1 else 0.25
+        USE_CALIB  = False if safe_level == 1 else True
+        USE_TTA    = False if safe_level == 1 else True
+        MIN_BLEND  = 0.60  if safe_level == 1 else 0.35
+        MAX_BLEND  = 0.92
+    print(f"[CFG] safe_mode={safe_level} | BIAS_SCALE={BIAS_SCALE}, BIAS_CLIP={BIAS_CLIP}, "
+          f"USE_CALIB={USE_CALIB}, USE_TTA={USE_TTA}, MIN_BLEND={MIN_BLEND}")
 
     # 1) Load
     train, test, building, sample_sub = load_data(data_dir)
@@ -476,7 +512,7 @@ def run_once(args, seed: int = 42) -> Dict[str, Any]:
     # 10) SMAPE-like sample weights (scaled2)
     sw_tr = 1.0 / (np.abs(y_tr_scaled2.values) + EPS)
 
-    # 11) Families
+    # 11) Families 선택(설치된 라이브러리만)
     all_fams = []
     for fam in args.families.split(","):
         fam = fam.strip().lower()
@@ -499,9 +535,7 @@ def run_once(args, seed: int = 42) -> Dict[str, Any]:
         raise RuntimeError("No models were trained. Check installed libraries or families flag.")
 
     # 13) Meta stacking (Ridge) on validation (scaled2)
-    Z_cols = []
-    for r in fam_kept:
-        Z_cols.append(r["va_scaled2"])
+    Z_cols = [r["va_scaled2"] for r in fam_kept]
     Z = np.vstack(Z_cols).T  # [n_va, k]
     meta = Ridge(alpha=1e-2, fit_intercept=False).fit(Z, y_va_scaled2.values)
     meta_w = meta.coef_.clip(0)
@@ -537,9 +571,12 @@ def run_once(args, seed: int = 42) -> Dict[str, Any]:
 
     # 16) Calibration & blend (orig)
     calib_map = per_building_calibration(train_fe, X_va, y_true_va_orig, yhat_va_orig)
-    blend_w = per_building_blend_weights(train_fe, X_va, y_true_va_orig, yhat_va_orig)
+    if safe_level >= 1:
+        calib_map = {int(k):(1.0, 0.0) for k in calib_map.keys()}  # 세이프 1/2: 캘리브 OFF
+    blend_w = per_building_blend_weights(train_fe, X_va, y_true_va_orig, yhat_va_orig,
+                                         min_blend=MIN_BLEND, max_blend=MAX_BLEND)
 
-    # 17) Report
+    # 17) Report (local validation)
     print("\n========== Local Validation (last {} days) ==========".format(args.valid_days))
     print("Families used & meta slots:")
     for i, r in enumerate(fam_kept):
@@ -547,7 +584,6 @@ def run_once(args, seed: int = 42) -> Dict[str, Any]:
     print("meta_w:", np.round(meta_w, 4).tolist())
     print(f"SMAPE - Model-only(ens+meta): {va_smape_model:.4f}")
     print(f"SMAPE - Naive(−168h)       : {va_smape_naive:.4f}")
-    # 캘리브+블렌드 검증 성능
     bno_va = train_fe.loc[mask_va, "건물번호"].astype(int).values
     a_arr = np.array([calib_map.get(int(b), (1.0, 0.0))[0] for b in bno_va])
     b_arr = np.array([calib_map.get(int(b), (1.0, 0.0))[1] for b in bno_va])
@@ -558,10 +594,11 @@ def run_once(args, seed: int = 42) -> Dict[str, Any]:
     print(f"SMAPE - Calibrated+Blend  : {va_smape_blend:.4f}")
     print("=====================================================\n")
 
-    # 18) Caps
-    cap_map = train.groupby("건물번호")[TARGET].quantile(0.998).to_dict()
+    # 18) Caps (글로벌 + 시간대별 hov caps)
+    cap_map_global = train.groupby("건물번호")[TARGET].quantile(0.998).to_dict()
+    cap_map_hov = train.groupby(["건물번호","hov"])[TARGET].quantile(0.995).to_dict()
 
-    # 19) Inference (AR + bias + calib + blend + clip + TTA)
+    # 19) Inference (AR + bias + calib + horizon blend + low-load soften + clip + TTA)
     feature_names = X_train.columns.tolist()
     from collections import deque
     seed_df = train.sort_values(["건물번호","일시_dt"])[["건물번호","일시_dt", TARGET]].copy()
@@ -575,13 +612,19 @@ def run_once(args, seed: int = 42) -> Dict[str, Any]:
     test_sorted = test.sort_values(["일시_dt","건물번호"]).copy()
     preds = []
 
-    TTA_SET = [
-        {"기온(°C)": +0.3, "습도(%)": 0, "풍속(m/s)": 0,   "강수량(mm)": 0},
-        {"기온(°C)": -0.3, "습도(%)": 0, "풍속(m/s)": 0,   "강수량(mm)": 0},
-        {"기온(°C)": 0,    "습도(%)": +3, "풍속(m/s)": 0.2, "강수량(mm)": 0},
-        {"기온(°C)": 0,    "습도(%)": -3, "풍속(m/s)": -0.2,"강수량(mm)": 0},
-        {"기온(°C)": 0,    "습도(%)": 0, "풍속(m/s)": 0,   "강수량(mm)": 0},
-    ]
+    # 건물별 최근 scaled2 스케일 (울트라 세이프에서 사용)
+    bld_recent_scale = compute_recent_bld_scale(train_fe, days=28)
+
+    # TTA 세트
+    TTA_SET = (
+        [{"기온(°C)": +0.3, "습도(%)": 0, "풍속(m/s)": 0, "강수량(mm)": 0},
+         {"기온(°C)": -0.3, "습도(%)": 0, "풍속(m/s)": 0, "강수량(mm)": 0},
+         {"기온(°C)": 0, "습도(%)": +3, "풍속(m/s)": 0.2, "강수량(mm)": 0},
+         {"기온(°C)": 0, "습도(%)": -3, "풍속(m/s)": -0.2, "강수량(mm)": 0},
+         {"기온(°C)": 0, "습도(%)": 0, "풍속(m/s)": 0, "강수량(mm)": 0}]
+        if (safe_level == 0 and USE_TTA) else
+        [{"기온(°C)": 0, "습도(%)": 0, "풍속(m/s)": 0, "강수량(mm)": 0}]
+    )
 
     def last_mean(dq, w):
         if len(dq) < w:
@@ -606,12 +649,17 @@ def run_once(args, seed: int = 42) -> Dict[str, Any]:
             vals.append(ysc)
         return float(np.mean(vals))
 
-    for _, row in test_sorted.iterrows():
+    n_total = len(test_sorted)
+    last_pct = -1
+    t_in_building: Dict[int, int] = {}
+
+    for idx, (_, row) in enumerate(test_sorted.iterrows()):
         b = int(row["건물번호"]); rid = int(row["row_id_for_align"])
         dq = history.get(b)
         if dq is None:
             dq = deque([], maxlen=max_need); history[b] = dq
 
+        # lag/rolling on-the-fly
         row_feats = {}
         for lag in LAG_LIST:
             row_feats[f"lag_{lag}"] = float(list(dq)[-lag]) if len(dq) >= lag else (float(np.mean(dq)) if len(dq) else 0.0)
@@ -623,47 +671,121 @@ def run_once(args, seed: int = 42) -> Dict[str, Any]:
         row_dict.update(row_feats)
         x_row_df = pd.DataFrame([row_dict], columns=feature_names)
 
+        # scaled2 예측
         yhat_scaled2 = predict_scaled2_with_tta(x_row_df)
-        hov = int(row["hov"])
-        yhat_scaled2 += float(bias_map.get((b, hov), 0.0))
 
+        # safe_level 0/1: bias 적용, 2: 미적용
+        hov = int(row["hov"])
+        if safe_level <= 1:
+            bias_adj = float(bias_map.get((b, hov), 0.0))
+            bias_adj = float(np.clip(bias_adj * BIAS_SCALE, -BIAS_CLIP, BIAS_CLIP))
+            yhat_scaled2 += bias_adj
+
+        # scaled2 → 원공간
         wk = float(row["wk_prof"]) if "wk_prof" in row else 1.0
         yhat_model = yhat_scaled2 * (wk + EPS)
 
-        a, b0 = calib_map.get(b, (1.0, 0.0))
-        yhat_model = a * yhat_model + b0
+        # 캘리브(세이프 0만 유효)
+        if safe_level == 0 and USE_CALIB:
+            a, b0 = calib_map.get(b, (1.0, 0.0))
+            yhat_model = a * yhat_model + b0
 
+        # 나이브
         naive = row_feats.get("lag_168", float(np.mean(dq) if len(dq) else 0.0))
-        w_bl = blend_w.get(b, 0.7)
-        yhat = w_bl*yhat_model + (1-w_bl)*naive
 
-        cap = cap_map.get(b, None)
+        # Horizon-weighted naive 강화
+        t = t_in_building.get(b, 0)
+        if safe_level >= 2:
+            alpha = 0.05 + 0.15 * min(t/168.0, 1.0)   # 모델 비중(1-w_bl_eff)
+        else:
+            alpha = 0.10 + 0.30 * min(t/168.0, 1.0)
+        w_bl_eff = max(blend_w.get(b, 0.7), 1.0 - alpha)  # naive 비중 하한
+        t_in_building[b] = t + 1
+
+        if safe_level >= 2:
+            # 울트라 세이프: 베이스라인(주간프로파일 × 최근 스케일)과 강블렌딩
+            s_recent = float(bld_recent_scale.get(b, 1.0))
+            base_prof = s_recent * (wk + EPS)
+            # 앙상블 힌트는 배제(안정 우선). 약간 넣으려면 아래 주석 해제:
+            # ens_hint = (ens_predict_scaled2_meta(x_row_df)[0]) * (wk + EPS)
+            # base_prof = 0.9*base_prof + 0.1*ens_hint
+            # 강보수 블렌딩
+            yhat = w_bl_eff*yhat_model + (1.0 - w_bl_eff)*naive
+            # 모델대신 베이스라인 쪽으로 더 당기기
+            yhat = 0.15*base_prof + 0.85*yhat
+        else:
+            # 일반/세이프1 경로
+            yhat = w_bl_eff*yhat_model + (1.0 - w_bl_eff)*naive
+
+        # 저부하 소프트 클립(야간/휴일 안정)
+        b_median = train.loc[train["건물번호"]==b, TARGET].median()
+        if np.isfinite(b_median) and b_median > 0:
+            ratio = yhat / b_median
+            if ratio < 0.2:
+                yhat = yhat * (0.8 + 1.0*ratio)  # 매우 낮은 부하에서 과예측 억제
+
+        # 시간대별 상한 + 글로벌 상한 클립
+        cap_g = cap_map_global.get(b, None)
+        cap_h = cap_map_hov.get((b, hov), None)
+        cap = None
+        if (cap_g is not None) and (cap_h is not None):
+            cap = min(cap_g * 1.10, cap_h * 1.05)
+        elif cap_g is not None:
+            cap = cap_g * 1.10
+        elif cap_h is not None:
+            cap = cap_h * 1.05
+
         if cap is not None:
-            yhat = float(np.clip(yhat, 0.0, cap * 1.15))
+            yhat = float(np.clip(yhat, 0.0, cap))
         else:
             yhat = max(0.0, yhat)
 
         preds.append(yhat)
         dq.append(yhat); history[b] = dq
 
+        # 간단 진행률
+        pct = int((idx+1)*100/n_total)
+        if pct >= last_pct + 10:
+            print(f"[PRED] progress ~{pct}% ({idx+1}/{n_total})")
+            last_pct = pct
+
     pred_df = test_sorted.copy()
     pred_df["pred"] = preds
     pred_df = pred_df[["num_date_time","pred"]]
 
-    # 20) Submission (저장 경로/성공 여부/완료 메시지까지 출력)
+    # 20) Submission: 정합성 검사 + 정렬 + 저장 + 완료 메시지
+    expect_n = len(sample_sub)
     sub = sample_sub.merge(pred_df, on="num_date_time", how="left")
     sub["answer"] = sub["pred"].astype(float)
-    sub = sub[["num_date_time","answer"]]
+
+    # NaN 처리(세이프: ffill/bfill/0)
+    missing = int(sub["answer"].isna().sum())
+    if missing > 0:
+        sub["answer"] = sub["answer"].fillna(method="ffill").fillna(method="bfill").fillna(0.0)
+        print(f"[WARN] Filled {missing} NaNs in answer by ffill/bfill/0")
+
+    # 정렬 + 중복/행수 체크
+    sub = sub[["num_date_time","answer"]].sort_values("num_date_time").reset_index(drop=True)
+    dup = int(sub["num_date_time"].duplicated().sum())
+    if dup > 0:
+        raise RuntimeError(f"Duplicate num_date_time in submission: {dup}")
+    if len(sub) != expect_n:
+        raise RuntimeError(f"Submission length mismatch. got {len(sub)}, expected {expect_n}")
+
+    # 값 범위 클립
+    sub["answer"] = sub["answer"].clip(lower=0.0)
+    print(f"[CHECK] submission rows={len(sub)}, dups=0, NaNs={int(sub['answer'].isna().sum())}")
+    print(f"[CHECK] answer stats: min={sub['answer'].min():.3f}, p50={sub['answer'].median():.3f}, p95={sub['answer'].quantile(0.95):.3f}, max={sub['answer'].max():.3f}")
 
     ensure_dir(args.out_dir)
     stamp = time.strftime("%m%d_%H%M%S")
     fname_ts = f"submission_es_seed{seed}_vd{args.valid_days}_{stamp}.csv"
     out_ts = os.path.join(args.out_dir, fname_ts)
     out_fixed = os.path.join(args.out_dir, "submission.csv")
-
     out_ts_abs = os.path.abspath(out_ts)
     out_fixed_abs = os.path.abspath(out_fixed)
 
+    print("[INFO] Generating submission files ...")
     try:
         sub.to_csv(out_ts_abs, index=False, encoding="utf-8-sig")
         sub.to_csv(out_fixed_abs, index=False, encoding="utf-8-sig")
@@ -674,7 +796,6 @@ def run_once(args, seed: int = 42) -> Dict[str, Any]:
 
     ok_ts = os.path.exists(out_ts_abs)
     ok_fixed = os.path.exists(out_fixed_abs)
-
     print("\n[SAVE] Attempted to save submissions:")
     print(" - timestamped:", out_ts_abs, "->", "OK" if ok_ts else "FAIL")
     print(" - latest     :", out_fixed_abs, "->", "OK" if ok_fixed else "FAIL")
@@ -688,6 +809,7 @@ def run_once(args, seed: int = 42) -> Dict[str, Any]:
         "smape_naive": round(float(va_smape_naive), 5),
         "smape_calib_blend": round(float(va_smape_blend), 5),
         "early_stopping_rounds": args.es_rounds,
+        "safe_mode": int(safe_level),
         "output_path_timestamped": out_ts_abs.replace("\\","/"),
         "output_path_submission_csv": out_fixed_abs.replace("\\","/"),
         "cwd_when_saving": os.path.abspath(os.getcwd()),
@@ -708,12 +830,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_dir", type=str, default=None, help="데이터 폴더(미지정 시 자동 탐색)")
     parser.add_argument("--out_dir",  type=str, default="./submissions")
-    parser.add_argument("--valid_days", type=int, default=7)
-    parser.add_argument("--n_models", type=int, default=3, help="가족별 배깅 모델 수")
-    parser.add_argument("--families", type=str, default="lgbm,xgb,cat,histgb",
-                        help="사용 모델 가족 CSV (예: lgbm,xgb,cat,histgb,mlp)")
+    parser.add_argument("--valid_days", type=int, default=14, help="검증 기간(일). 기본 14로 보수화")
+    parser.add_argument("--n_models", type=int, default=1, help="가족별 배깅 모델 수(울트라 세이프 기본 1)")
+    parser.add_argument("--families", type=str, default="histgb",
+                        help="사용 모델 가족 CSV (예: histgb / lgbm,histgb / lgbm,xgb,cat,histgb,mlp)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--es_rounds", type=int, default=200, help="EarlyStopping patience(라운드)")
+    parser.add_argument("--safe_mode", type=int, default=2,
+                        help="2: 울트라 세이프(권장, LB 안정화 최우선) / 1: 세이프 / 0: 풀기능")
     args, _ = parser.parse_known_args()
 
     ensure_dir(args.out_dir)
